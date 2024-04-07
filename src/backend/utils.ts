@@ -12,6 +12,7 @@ import {
   GameStatus
 } from 'common/types'
 import axios from 'axios'
+import https from 'node:https'
 import { app, dialog, shell, Notification, BrowserWindow } from 'electron'
 import {
   exec,
@@ -145,9 +146,9 @@ const getFileSize = fileSize.partial({ base: 2 }) as (arg: unknown) => string
 function getWineFromProton(
   wineVersion: WineInstallation,
   winePrefix: string
-): { winePrefix: string; wineBin: string } {
+): { winePrefix: string; wineVersion: WineInstallation } {
   if (wineVersion.type !== 'proton') {
-    return { winePrefix, wineBin: wineVersion.bin }
+    return { winePrefix, wineVersion }
   }
 
   winePrefix = join(winePrefix, 'pfx')
@@ -156,8 +157,17 @@ function getWineFromProton(
   for (const distPath of ['dist', 'files']) {
     const protonBaseDir = dirname(wineVersion.bin)
     const wineBin = join(protonBaseDir, distPath, 'bin', 'wine')
-    if (existsSync(wineBin)) {
-      return { wineBin, winePrefix }
+    if (!existsSync(wineBin)) continue
+
+    const wineserverBin = join(protonBaseDir, distPath, 'bin', 'wineserver')
+    return {
+      winePrefix,
+      wineVersion: {
+        ...wineVersion,
+        type: 'wine',
+        bin: wineBin,
+        wineserver: existsSync(wineserverBin) ? wineserverBin : undefined
+      }
     }
   }
 
@@ -170,7 +180,7 @@ function getWineFromProton(
     LogPrefix.Backend
   )
 
-  return { wineBin: '', winePrefix }
+  return { wineVersion, winePrefix }
 }
 
 async function isEpicServiceOffline(
@@ -189,7 +199,7 @@ async function isEpicServiceOffline(
   })
 
   try {
-    const { data } = await axios.get(epicStatusApi)
+    const { data } = await axiosClient.get(epicStatusApi)
 
     for (const component of data.components) {
       const { name: name, status: indicator } = component
@@ -684,7 +694,7 @@ const getLatestReleases = async (): Promise<Release[]> => {
   logInfo('Checking for new Heroic Updates', LogPrefix.Backend)
 
   try {
-    const { data: releases } = await axios.get(GITHUB_API)
+    const { data: releases } = await axiosClient.get(GITHUB_API)
     const latestStable: Release = releases.filter(
       (rel: Release) => rel.prerelease === false
     )[0]
@@ -730,7 +740,9 @@ const getCurrentChangelog = async (): Promise<Release | null> => {
   try {
     const current = app.getVersion()
 
-    const { data: release } = await axios.get(`${GITHUB_API}/tags/v${current}`)
+    const { data: release } = await axiosClient.get(
+      `${GITHUB_API}/tags/v${current}`
+    )
 
     return release as Release
   } catch (error) {
@@ -870,7 +882,7 @@ export async function downloadDefaultWine() {
 
   // download the latest version
   const onProgress = (state: State, progress?: ProgressInfo) => {
-    sendFrontendMessage('progressOfWineManager' + release.version, {
+    sendFrontendMessage(`progressOfWineManager${release.version}`, {
       state,
       progress
     })
@@ -996,41 +1008,33 @@ export async function moveOnWindows(
   newInstallPath = join(newInstallPath, basename(install_path))
 
   let currentFile = ''
-  let currentPercent = ''
 
   // move using robocopy and show progress of the current file being copied
   const { code, stderr } = await spawnAsync(
     'robocopy',
-    [install_path, newInstallPath, '/MOVE', '/MIR'],
+    [install_path, newInstallPath, '/MOVE', '/MIR', '/NJH', '/NJS', '/NDL'],
     { stdio: 'pipe' },
     (data) => {
-      data = data.replaceAll(/\s/g, ' ')
+      let percent = 0
+      const percentMatch = data.match(/(\d+)(?:\.\d+)?%/)?.[1]
+      if (percentMatch) percent = Number(percentMatch)
 
-      const match = data.split(' ').filter(Boolean)
-      // current percentage
-      const percent = match.filter((m) => m.includes('%'))[0]
-      // current file
-      const file = match[match.length - 1]
-      if (percent) {
-        currentPercent = percent
-      }
+      const filenameMatch = data.match(/([\w.:\\]+)$/)?.[1]
+      if (filenameMatch) currentFile = filenameMatch
 
-      if (file && file.includes('.') && !file.includes('%')) {
-        currentPercent = '0%'
-        currentFile = file
-      }
-
-      if (match) {
-        sendFrontendMessage(`progressUpdate-${gameInfo.app_name}`, {
-          appName: gameInfo.app_name,
-          runner: gameInfo.runner,
-          status: 'moving',
-          progress: {
-            percent: currentPercent,
-            file: currentFile
-          }
-        })
-      }
+      sendFrontendMessage(`progressUpdate-${gameInfo.app_name}`, {
+        appName: gameInfo.app_name,
+        runner: gameInfo.runner,
+        status: 'moving',
+        progress: {
+          percent,
+          file: currentFile,
+          // FIXME: Robocopy does not report bytes moved / an ETA, so we have to
+          //        leave these blank for now
+          bytes: '',
+          eta: ''
+        }
+      })
     }
   )
   if (code !== 0) {
@@ -1058,7 +1062,6 @@ export async function moveOnUnix(
   const destination = join(newInstallPath, basename(install_path))
 
   let currentFile = ''
-  let currentPercent = ''
 
   let rsyncExists = false
   try {
@@ -1070,38 +1073,72 @@ export async function moveOnUnix(
   if (rsyncExists) {
     const origin = install_path + '/'
     logInfo(
-      `moving command: rsync -az --progress ${origin} ${destination} `,
+      `moving command: rsync --archive --compress --no-human-readable --remove-source-files --info=name,progress ${origin} ${destination} `,
       LogPrefix.Backend
     )
     const { code, stderr } = await spawnAsync(
       'rsync',
-      ['-az', '--progress', origin, destination],
+      [
+        '--archive',
+        '--compress',
+        '--no-human-readable',
+        '--remove-source-files',
+        '--info=name,progress',
+        origin,
+        destination
+      ],
       { stdio: 'pipe' },
       (data) => {
-        const split =
-          data
-            .split('\n')
-            .find((d) => d.includes('/') && !d.includes('%'))
-            ?.split('/') || []
-        const file = split.at(-1) || ''
+        let percent = 0
+        let eta = ''
+        let bytes = '0'
 
-        if (file) {
-          currentFile = file
+        // Multiple output lines might be buffered into a single `data`, so
+        // we have to iterate over every line (we can't just look at the last
+        // one since that might skip new files)
+        for (const outLine of data.trim().split('\n')) {
+          // Rsync outputs either the file currently being transferred or a
+          // progress report. To know which one of those `outLine` is, we check
+          // if it includes a %, :, and starts with a space
+          // If all of these aren't the case, it's *most likely* a filename
+          // FIXME: This is pretty hacky, but I don't see an obvious way to
+          //        "divide" the two output types other than that
+          const isFilenameOutput =
+            !outLine.includes('%') &&
+            !outLine.includes(':') &&
+            !outLine.startsWith(' ')
+
+          if (isFilenameOutput) {
+            // If we have a filename output, set `lastFile` and reset all
+            // other metrics. Either there'll be a progress update in the next
+            // line of `data`, or we've just started copying and thus start at 0
+            currentFile = outLine
+            percent = 0
+            eta = ''
+            bytes = '0'
+          } else {
+            // If we got the progress update, try to read out the bytes, ETA and
+            // percent
+            const bytesMatch = outLine.match(/^\s+(\d+)/)?.[1]
+            const etaMatch = outLine.match(/(\d+:\d{2}:\d{2})/)?.[1]
+            const percentMatch = outLine.match(/(\d+)%/)?.[1]
+            if (bytesMatch) bytes = getFileSize(Number(bytesMatch))
+            if (etaMatch) eta = etaMatch
+            if (percentMatch) percent = Number(percentMatch)
+          }
         }
 
-        const percent = data.match(/(\d+)%/)
-        if (percent) {
-          currentPercent = percent[0]
-          sendFrontendMessage(`progressUpdate-${gameInfo.app_name}`, {
-            appName: gameInfo.app_name,
-            runner: gameInfo.runner,
-            status: 'moving',
-            progress: {
-              percent: currentPercent,
-              file: currentFile
-            }
-          })
-        }
+        sendFrontendMessage(`progressUpdate-${gameInfo.app_name}`, {
+          appName: gameInfo.app_name,
+          runner: gameInfo.runner,
+          status: 'moving',
+          progress: {
+            percent,
+            eta,
+            bytes,
+            file: currentFile
+          }
+        })
       }
     )
     if (code !== 1) {
@@ -1236,7 +1273,7 @@ export async function downloadFile({
 
   const connections = 5
   try {
-    const response = await axios.head(url)
+    const response = await axiosClient.head(url)
     fileSize = parseInt(response.headers['content-length'], 10)
   } catch (err) {
     logError(
@@ -1437,6 +1474,11 @@ async function extractDecompress(
   }
 }
 
+const axiosClient = axios.create({
+  timeout: 10 * 1000,
+  httpsAgent: new https.Agent({ keepAlive: true })
+})
+
 export {
   errorHandler,
   execAsync,
@@ -1471,7 +1513,8 @@ export {
   sendGameStatusUpdate,
   sendProgressUpdate,
   calculateEta,
-  extractFiles
+  extractFiles,
+  axiosClient
 }
 
 // Exported only for testing purpose
