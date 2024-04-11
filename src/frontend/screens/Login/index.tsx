@@ -2,7 +2,7 @@ import React, { useContext, useEffect, useState } from 'react'
 import './index.scss'
 import Runner from './components/Runner'
 import { useTranslation } from 'react-i18next'
-import { useNavigate } from 'react-router'
+import { useNavigate } from 'react-router-dom'
 
 import EpicLogo from 'frontend/assets/epic-logo.svg?react'
 import GOGLogo from 'frontend/assets/gog-logo.svg?react'
