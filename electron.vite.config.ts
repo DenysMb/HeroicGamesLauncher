@@ -1,11 +1,11 @@
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react-swc'
 import svgr from 'vite-plugin-svgr'
-import { join } from 'path'
+import path from 'path'
 
 const srcAliases = ['backend', 'frontend', 'common'].map((aliasName) => ({
   find: aliasName,
-  replacement: join(__dirname, 'src', aliasName)
+  replacement: path.join(__dirname, 'src', aliasName)
 }))
 
 const dependenciesToNotExternalize = [
@@ -43,7 +43,7 @@ export default defineConfig(({ mode }) => ({
     root: '.',
     build: {
       rollupOptions: {
-        input: '/index.html'
+        input: path.resolve('index.html')
       },
       target: 'esnext',
       outDir: 'build',
