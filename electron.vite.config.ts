@@ -10,8 +10,7 @@ const srcAliases = ['backend', 'frontend', 'common'].map((aliasName) => ({
 
 const dependenciesToNotExternalize = [
   '@xhmikosr/decompress',
-  '@xhmikosr/decompress-targz',
-  'check-disk-space'
+  '@xhmikosr/decompress-targz'
 ]
 
 export default defineConfig(({ mode }) => ({
